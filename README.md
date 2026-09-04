@@ -81,4 +81,5 @@ register.
 
 ## Author
 
-FILL IN: name, student ID.
+Romik Gurung
+S374535
