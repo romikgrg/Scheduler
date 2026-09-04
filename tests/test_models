@@ -1,0 +1,290 @@
+"""Tests for the domain models.
+
+Group A - TimeSlot validation
+Group B - Overlap and ordering
+Group C - Room and capacity
+Group D - Lecturer availability
+Group E - Session validation
+Group F - build_week helper
+"""
+
+import pytest
+
+from timetable.exceptions import ValidationError
+from timetable.models import (
+    DAY_END,
+    DAY_START,
+    Lecturer,
+    Room,
+    Session,
+    TimeSlot,
+    build_week,
+)
+
+
+# --------------------------------------------------------------- Group A
+# What is tested: a time slot must describe a real period on a real
+#   teaching day.
+# Why it is necessary: every later rule (clashes, availability) reads
+#   these fields, so bad data here would silently corrupt the timetable.
+# Defect prevented: classes scheduled on a Saturday, at 3 a.m., or with
+#   a negative length.
+
+class TestTimeSlotValidation:
+    def test_valid_slot_is_created(self):
+        slot = TimeSlot("MON", 9, 11)
+        assert slot.day == "MON"
+        assert slot.duration_hours == 2
+
+    def test_day_is_normalised_to_upper_case(self):
+        assert TimeSlot("mon", 9, 11).day == "MON"
+        assert TimeSlot(" tue ", 9, 11).day == "TUE"
+
+    def test_unknown_day_is_rejected(self):
+        with pytest.raises(ValidationError):
+            TimeSlot("SAT", 9, 11)
+
+    def test_end_before_start_is_rejected(self):
+        with pytest.raises(ValidationError):
+            TimeSlot("MON", 11, 9)
+
+    def test_zero_length_slot_is_rejected(self):
+        with pytest.raises(ValidationError):
+            TimeSlot("MON", 9, 9)
+
+    @pytest.mark.parametrize("bad", ["9", 9.5, None, True])
+    def test_non_integer_hours_are_rejected(self, bad):
+        # True is included on purpose: in Python bool is a subclass of
+        # int, so a naive isinstance check would accept it as hour 1.
+        with pytest.raises(ValidationError):
+            TimeSlot("MON", bad, 11)
+
+    # Boundary conditions: the first and last legal hours of the day.
+    def test_earliest_legal_start_is_accepted(self):
+        assert TimeSlot("MON", DAY_START, DAY_START + 1).start_hour == DAY_START
+
+    def test_one_hour_before_opening_is_rejected(self):
+        with pytest.raises(ValidationError):
+            TimeSlot("MON", DAY_START - 1, DAY_START + 1)
+
+    def test_latest_legal_end_is_accepted(self):
+        assert TimeSlot("FRI", DAY_END - 1, DAY_END).end_hour == DAY_END
+
+    def test_one_hour_past_closing_is_rejected(self):
+        with pytest.raises(ValidationError):
+            TimeSlot("FRI", DAY_END - 1, DAY_END + 1)
+
+
+# --------------------------------------------------------------- Group B
+# What is tested: overlap detection and week ordering.
+# Why it is necessary: this one method decides every clash in the whole
+#   system, so an error here is invisible but serious.
+# Defect prevented: legal back-to-back classes reported as a clash, or a
+#   real double booking allowed through.
+
+class TestTimeSlotOverlap:
+    def test_identical_slots_overlap(self):
+        assert TimeSlot("MON", 9, 11).overlaps(TimeSlot("MON", 9, 11))
+
+    def test_partial_overlap_is_detected(self):
+        assert TimeSlot("MON", 9, 11).overlaps(TimeSlot("MON", 10, 12))
+
+    def test_touching_slots_do_not_overlap(self):
+        # 09:00-11:00 then 11:00-13:00 is legal back-to-back teaching.
+        assert not TimeSlot("MON", 9, 11).overlaps(TimeSlot("MON", 11, 13))
+
+    def test_same_time_different_day_does_not_overlap(self):
+        assert not TimeSlot("MON", 9, 11).overlaps(TimeSlot("TUE", 9, 11))
+
+    def test_overlap_is_symmetric(self):
+        a, b = TimeSlot("WED", 9, 12), TimeSlot("WED", 11, 13)
+        assert a.overlaps(b) == b.overlaps(a)
+
+    def test_containment(self):
+        outer, inner = TimeSlot("MON", 9, 17), TimeSlot("MON", 10, 12)
+        assert outer.contains(inner)
+        assert not inner.contains(outer)
+
+    def test_ordering_across_the_week(self):
+        assert TimeSlot("MON", 15, 17).starts_before(TimeSlot("TUE", 9, 11))
+        assert not TimeSlot("TUE", 9, 11).starts_before(TimeSlot("MON", 15, 17))
+
+    def test_str_is_readable(self):
+        assert str(TimeSlot("MON", 9, 11)) == "MON 09:00-11:00"
+
+
+# --------------------------------------------------------------- Group C
+# What is tested: a room seats a whole number of students, at least one,
+#   and the capacity check is inclusive.
+# Why it is necessary: the seat limit is a strict inequality, which is
+#   the classic place for an off-by-one error.
+# Defect prevented: overcrowded rooms, or a room being wrongly refused
+#   when the class exactly fills it.
+
+class TestRoom:
+    def test_capacity_boundary_exact_fit_is_allowed(self):
+        assert Room("R1", 30).can_seat(30)
+
+    def test_one_student_over_capacity_is_refused(self):
+        assert not Room("R1", 30).can_seat(31)
+
+    def test_room_with_spare_seats_is_fine(self):
+        assert Room("R1", 30).can_seat(20)
+
+    def test_zero_capacity_is_rejected(self):
+        with pytest.raises(ValidationError):
+            Room("R1", 0)
+
+    def test_negative_capacity_is_rejected(self):
+        with pytest.raises(ValidationError):
+            Room("R1", -5)
+
+    def test_non_integer_capacity_is_rejected(self):
+        with pytest.raises(ValidationError):
+            Room("R1", "30")
+
+    def test_empty_room_id_is_rejected(self):
+        with pytest.raises(ValidationError):
+            Room("   ", 30)
+
+    def test_non_string_room_id_is_rejected(self):
+        with pytest.raises(ValidationError):
+            Room(42, 30)
+
+
+# --------------------------------------------------------------- Group D
+# What is tested: a lecturer is free only inside their stated windows.
+# Why it is necessary: staff availability is a hard constraint in the
+#   assignment brief, and a session must fit entirely inside a window.
+# Defect prevented: booking a lecturer outside their contracted hours,
+#   or half-inside a window.
+
+class TestLecturerAvailability:
+    def test_no_stated_availability_means_always_free(self):
+        assert Lecturer("L1", "Dr Kim").is_available(TimeSlot("FRI", 18, 20))
+
+    def test_slot_inside_window_is_available(self):
+        lect = Lecturer("L1", "Dr Kim", (TimeSlot("MON", 9, 17),))
+        assert lect.is_available(TimeSlot("MON", 10, 12))
+
+    def test_slot_exactly_filling_the_window_is_available(self):
+        lect = Lecturer("L1", "Dr Kim", (TimeSlot("MON", 9, 11),))
+        assert lect.is_available(TimeSlot("MON", 9, 11))
+
+    def test_slot_partly_outside_window_is_not_available(self):
+        lect = Lecturer("L1", "Dr Kim", (TimeSlot("MON", 9, 12),))
+        assert not lect.is_available(TimeSlot("MON", 11, 13))
+
+    def test_slot_on_another_day_is_not_available(self):
+        lect = Lecturer("L1", "Dr Kim", (TimeSlot("MON", 9, 17),))
+        assert not lect.is_available(TimeSlot("TUE", 10, 12))
+
+    def test_second_window_is_also_checked(self):
+        lect = Lecturer("L1", "Dr Kim", (TimeSlot("MON", 9, 11), TimeSlot("WED", 13, 17)))
+        assert lect.is_available(TimeSlot("WED", 14, 16))
+
+    def test_availability_must_hold_timeslots(self):
+        with pytest.raises(ValidationError):
+            Lecturer("L1", "Dr Kim", ("MON 9-11",))
+
+    def test_empty_lecturer_name_is_rejected(self):
+        with pytest.raises(ValidationError):
+            Lecturer("L1", "")
+
+
+# --------------------------------------------------------------- Group E
+# What is tested: a session describes a real class, and preference
+#   matching works by containment rather than exact equality.
+# Why it is necessary: invalid sessions must be rejected before the
+#   search wastes time on them or crashes deep inside.
+# Defect prevented: zero-student or impossibly long classes reaching the
+#   scheduler.
+
+class TestSession:
+    def _session(self, **overrides):
+        data = dict(
+            session_id="S1", unit_code="prt582", lecturer_id="L1",
+            enrolment=25, duration_hours=2, student_group="G1",
+        )
+        data.update(overrides)
+        return Session(**data)
+
+    def test_valid_session_is_created(self):
+        assert self._session().session_id == "S1"
+
+    def test_unit_code_is_normalised_to_upper_case(self):
+        assert self._session().unit_code == "PRT582"
+
+    def test_smallest_valid_class_is_one_student(self):
+        assert self._session(enrolment=1).enrolment == 1
+
+    def test_zero_enrolment_is_rejected(self):
+        with pytest.raises(ValidationError):
+            self._session(enrolment=0)
+
+    def test_non_integer_enrolment_is_rejected(self):
+        with pytest.raises(ValidationError):
+            self._session(enrolment=25.5)
+
+    def test_negative_duration_is_rejected(self):
+        with pytest.raises(ValidationError):
+            self._session(duration_hours=-2)
+
+    def test_duration_equal_to_the_teaching_day_is_allowed(self):
+        assert self._session(duration_hours=DAY_END - DAY_START).duration_hours == 12
+
+    def test_duration_longer_than_the_teaching_day_is_rejected(self):
+        with pytest.raises(ValidationError):
+            self._session(duration_hours=DAY_END - DAY_START + 1)
+
+    def test_empty_session_id_is_rejected(self):
+        with pytest.raises(ValidationError):
+            self._session(session_id="")
+
+    def test_empty_student_group_is_rejected(self):
+        with pytest.raises(ValidationError):
+            self._session(student_group="  ")
+
+    def test_preference_uses_containment_not_equality(self):
+        # A session that prefers Monday morning should be happy with any
+        # slot inside that window, not only an exact match.
+        session = self._session(preferred_slots=(TimeSlot("MON", 9, 17),))
+        assert session.prefers(TimeSlot("MON", 10, 12))
+        assert not session.prefers(TimeSlot("TUE", 10, 12))
+
+    def test_no_preference_means_nothing_is_preferred(self):
+        assert not self._session().prefers(TimeSlot("MON", 9, 11))
+
+
+# --------------------------------------------------------------- Group F
+# What is tested: the helper that chops a week into equal teaching blocks.
+# Why it is necessary: it is the usual way callers build the slot list, so
+#   an error here would quietly change every timetable.
+# Defect prevented: a partial block at the end of the day being offered as
+#   a valid teaching slot.
+
+class TestBuildWeek:
+    def test_five_days_of_four_blocks(self):
+        slots = build_week(start=9, end=17, block=2)
+        assert len(slots) == 20
+        assert all(s.duration_hours == 2 for s in slots)
+
+    def test_blocks_are_in_order_within_a_day(self):
+        slots = build_week(days=("MON",), start=9, end=15, block=2)
+        assert [str(s) for s in slots] == [
+            "MON 09:00-11:00", "MON 11:00-13:00", "MON 13:00-15:00",
+        ]
+
+    def test_a_partial_trailing_block_is_dropped(self):
+        # 09:00-16:00 in two-hour blocks leaves a one-hour remainder,
+        # which must not be offered as a teaching slot.
+        slots = build_week(days=("MON",), start=9, end=16, block=2)
+        assert len(slots) == 3
+        assert slots[-1].end_hour == 15
+
+    def test_block_longer_than_the_day_produces_nothing(self):
+        assert build_week(days=("MON",), start=9, end=11, block=5) == []
+
+    def test_zero_block_is_rejected(self):
+        with pytest.raises(ValidationError):
+            build_week(block=0)
