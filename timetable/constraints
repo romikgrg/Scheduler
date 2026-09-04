@@ -1,0 +1,97 @@
+"""Hard constraints.
+
+Each function answers one yes/no question about placing a session.
+Keeping them separate from the search algorithm means each rule can be
+unit tested on its own, and a failure points straight at the broken rule
+instead of somewhere inside the search. It also means a new rule can be
+added later without touching the scheduler.
+
+Every clash rule takes `placed`, the assignments made so far, and asks
+whether one more placement would conflict with any of them.
+"""
+
+from typing import Iterable
+
+from .models import Assignment, Lecturer, Room, Session, TimeSlot
+
+
+def room_is_big_enough(session: Session, room: Room) -> bool:
+    """The room must seat the whole class. Exactly full is acceptable."""
+    return room.can_seat(session.enrolment)
+
+
+def duration_matches_slot(session: Session, slot: TimeSlot) -> bool:
+    """A session must exactly fill its slot.
+
+    Allowing a shorter session would leave the rest of the block booked
+    but unused, which the rest of the system has no way to represent.
+    """
+    return session.duration_hours == slot.duration_hours
+
+
+def lecturer_is_available(lecturer: Lecturer, slot: TimeSlot) -> bool:
+    """The slot must fall inside one of the lecturer's stated windows."""
+    return lecturer.is_available(slot)
+
+
+def lecturer_is_free(placed: Iterable[Assignment], session: Session, slot: TimeSlot) -> bool:
+    """No lecturer may teach two sessions at once.
+
+    Back-to-back teaching is allowed, because TimeSlot.overlaps treats
+    touching slots as non-overlapping.
+    """
+    return not any(
+        a.session.lecturer_id == session.lecturer_id and a.slot.overlaps(slot)
+        for a in placed
+    )
+
+
+def room_is_free(placed: Iterable[Assignment], room: Room, slot: TimeSlot) -> bool:
+    """No room may host two sessions at once.
+
+    Rooms are compared by id, not object identity: two Room objects with
+    the same id refer to the same physical room.
+    """
+    return not any(a.room.room_id == room.room_id and a.slot.overlaps(slot) for a in placed)
+
+
+def group_is_free(placed: Iterable[Assignment], session: Session, slot: TimeSlot) -> bool:
+    """A student cohort cannot be in two places at once."""
+    return not any(
+        a.session.student_group == session.student_group and a.slot.overlaps(slot)
+        for a in placed
+    )
+
+
+def prerequisites_respected(placed, session: Session, slot: TimeSlot, prerequisites) -> bool:
+    """A unit must be taught after every unit listed as its prerequisite.
+
+    The rule is checked in BOTH directions on every placement, because
+    the scheduler does not place sessions in timetable order. Looking
+    only at "are my own prerequisites already down and earlier?" can be
+    bypassed: if the dependent unit is placed first, its prerequisite is
+    not in `placed` yet, nothing is checked, and the prerequisite is then
+    free to land later in the week.
+
+    So each placement asks two questions:
+
+    1. Is every already-placed prerequisite of mine earlier than me?
+    2. Is every already-placed unit that depends on me later than me?
+
+    Unlike the clash rules this compares position in the week rather than
+    overlap, so it uses TimeSlot.starts_before. Simultaneous is not
+    "after", so an equal start time is refused in both directions.
+    """
+    required = {code.upper() for code in prerequisites.get(session.unit_code, ())}
+
+    for earlier in placed:
+        # 1. this session must come after its own prerequisites
+        if earlier.session.unit_code in required and not earlier.slot.starts_before(slot):
+            return False
+
+        # 2. and before any placed unit that lists it as a prerequisite
+        dependants = {c.upper() for c in prerequisites.get(earlier.session.unit_code, ())}
+        if session.unit_code in dependants and not slot.starts_before(earlier.slot):
+            return False
+
+    return True
